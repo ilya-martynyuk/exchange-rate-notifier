@@ -1,0 +1,98 @@
+#!/usr/bin/php
+<?php
+
+require_once(__DIR__ . '/simple_html_dom.php');
+require_once(__DIR__ . '/vendor/autoload.php');
+
+$config = require_once(__DIR__ . '/config.php');
+
+if (file_exists(__DIR__ . '/config.local.php')) {
+    $localConfig = require_once(__DIR__ . '/config.local.php');
+
+    $config = array_merge($config, $localConfig);
+}
+
+$siteUrl = 'http://minfin.com.ua/currency/auction/usd/sell/nikolaev/?presort=&sort=time&order=desc';
+$htmlDoc = file_get_html($siteUrl);
+
+$results = $htmlDoc->find('.au-deal-row');
+$minimumRateOrderNode = null;
+$maxRate = 0;
+$minRate = 0;
+
+foreach ($results as $result) {
+    $rate = $result->children(1)->innertext;
+
+    if ($rate > $maxRate) {
+        $maxRate = $rate;
+    }
+
+    if (0 === $minRate || $rate < $minRate) {
+        $minRate = $rate;
+        $minimumRateOrderNode = $result;
+    }
+}
+
+if (null === $minimumRateOrderNode) {
+    return;
+}
+
+$actualMinRate = $minimumRateOrderNode->children(1)->innertext;
+$cachedMinRate = @file_get_contents($config['cacheFilePath']);
+
+if ($actualMinRate === $cachedMinRate) {
+     return;
+}
+
+@file_put_contents($config['cacheFilePath'], $actualMinRate);
+
+$phoneNumberText =  trim($minimumRateOrderNode->children(4)->innertext);
+preg_match('/data-bid-id="(.*)"/', $phoneNumberText, $res);
+$bid = $res[1];
+
+$url = "http://minfin.com.ua/modules/connector/connector.php?action=auction-get-contacts&bid=" . ($bid + 2) . "&r=true";
+$ch = curl_init($url);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_BINARYTRANSFER, true);
+curl_setopt($ch, CURLOPT_AUTOREFERER, true );
+curl_setopt($ch, CURLOPT_POST, true);
+curl_setopt($ch, CURLOPT_POSTFIELDS, [
+    'bid' => $bid,
+    'action' => 'auction-get-contacts',
+    'r' => 'true'
+]);
+curl_setopt($ch, CURLOPT_REFERER, $siteUrl);
+curl_setopt($ch, CURLOPT_USERAGENT,'Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.8.1.13) Gecko/20080311 Firefox/2.0.0.13');
+curl_setopt($ch, CURLOPT_COOKIEFILE, 'cookie.txt');
+
+$contents = curl_exec($ch);
+curl_close($ch);
+
+$phoneNumberMissingPart = json_decode($contents)->data;
+$formattedPhone = preg_replace('/&nbsp;<a.*\/a>/', $phoneNumberMissingPart, $phoneNumberText);
+$formattedPhone = preg_replace("/[^0-9,.]/", "", $formattedPhone);
+
+$data = [
+    "Min: $minRate",
+    "Prev min: $cachedMinRate",
+    "Max: $maxRate",
+    "Phone: $formattedPhone",
+    "Desc: " . trim($minimumRateOrderNode->children(3)->children(0)->innertext)
+];
+
+exec(sprintf("/usr/bin/notify-send -u critical '%s' '%s'", $config['emailSubject'], implode("\n", $data)));
+
+$mail = new PHPMailer();
+$mail->IsSMTP();
+$mail->SMTPAuth = true;
+$mail->SMTPSecure = 'ssl';
+$mail->Host = $config['smtpHost'];
+$mail->Port = $config['smtpPort'];
+$mail->IsHTML(true);
+$mail->Username = $config['smptUsername'];
+$mail->Password = $config['smptPassword'];
+$mail->SetFrom($config['emailTo']);
+$mail->Subject = $config['emailSubject'];
+$mail->Body = implode("<br>", $data);
+$mail->AddAddress($config['emailTo']);
+$mail->Send();
